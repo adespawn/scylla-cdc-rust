@@ -7,7 +7,9 @@ use std::time::{self, Duration};
 use async_trait::async_trait;
 use itertools::Itertools;
 use scylla::client::session::Session;
-use scylla::errors::{DbError, ExecutionError, PrepareError, RequestAttemptError};
+use scylla::errors::{
+    ConnectionPoolError, DbError, ExecutionError, PrepareError, RequestAttemptError,
+};
 use scylla::response::query_result::QueryResult;
 use scylla::response::{PagingState, PagingStateResponse};
 use scylla::statement::prepared::PreparedStatement;
@@ -251,12 +253,26 @@ impl StreamReader {
                         PagingStateResponse::NoMorePages => break,
                     }
                 }
+                // The assumption here is we want to have the CDC running no matter what happens to the connection to the database:
+                // be it a broken connection, timeout, etc.
+                // The rest of the logic will assume that we will still collect all data, even if we lag behind.
+                // Why not use the retry policy here? The rust driver does not support async retry policies,
+                // meaning we cannot delay the next retry when using the policy.
+                // On the other hand, we would prefer to have (exponential) backoff here, to avoid overloading the database,
+                // especially this CDC is the part of the problem (remember that we may have few hundred streamIDs - and as a result
+                // create few hundred requests to the database at a single moment).
                 Err(
                     err @ ExecutionError::RequestTimeout(_)
                     | err @ ExecutionError::LastAttemptError(RequestAttemptError::DbError(
                         DbError::ReadTimeout { .. },
                         _,
-                    )),
+                    ))
+                    | err @ ExecutionError::LastAttemptError(
+                        RequestAttemptError::BrokenConnectionError(_),
+                    )
+                    | err @ ExecutionError::ConnectionPoolError(ConnectionPoolError::Broken {
+                        last_connection_error: _,
+                    }),
                 ) => {
                     self.print_timeout_warning(
                         &window_begin,
