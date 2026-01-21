@@ -5,7 +5,7 @@ mod tests {
     use std::convert::identity;
     use std::hash::Hash;
     use std::sync::Arc;
-    use std::time;
+    use std::time::{self, Duration};
 
     use anyhow::{Result, bail};
     use async_trait::async_trait;
@@ -20,7 +20,11 @@ mod tests {
     use scylla::statement::prepared::PreparedStatement;
     use scylla::value::CqlValue;
     use scylla_cdc_test_utils::{now, prepare_db, skip_if_not_supported};
+    use scylla_proxy::{Reaction, ResponseReaction, ResponseRule, RunningProxy};
     use tokio::sync::Mutex;
+    use tokio::sync::mpsc::Sender;
+    use tracing::info;
+    use tracing_test::traced_test;
 
     use crate::checkpoints::TableBackedCheckpointSaver;
     use crate::consumer::*;
@@ -513,5 +517,236 @@ mod tests {
                 format!("Test not passed for table {}.", test.table_name)
             );
         }
+    }
+
+    async fn generate_cdc_update(session: &Arc<Session>, keyspace: &str) {
+        session
+            .query_unpaged(
+                format!("INSERT INTO {}.cdc_test_table (id) VALUES (?)", keyspace),
+                (uuid::Uuid::new_v4(),),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn init_db(session: &Arc<Session>, keyspace: &str) {
+        // We need to disable tablets for this test. See https://github.com/scylladb/scylladb/issues/16317
+        session
+        .query_unpaged(
+            format!("CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{'enabled': false}}", keyspace),
+            ()
+        )
+        .await.unwrap();
+
+        session
+        .query_unpaged(
+            format!("CREATE TABLE IF NOT EXISTS {}.cdc_test_table (id UUID PRIMARY KEY) WITH cdc = {{'enabled': true}}", keyspace),
+            ()
+        )
+        .await.unwrap();
+    }
+
+    enum State {
+        WaitingForFirst,
+        Disabled,
+        WaitingForReconnection,
+    }
+
+    #[derive(Clone, Copy)]
+    enum DropReason {
+        DropPackets,
+        _DropConnection,
+    }
+
+    // A simple consumer that just prints the received CDC data.
+    struct SimpleConsumer {
+        proxy: Arc<Mutex<RunningProxy>>,
+        state: Arc<Mutex<State>>,
+        finisher: Sender<()>,
+        reconnection: Sender<()>,
+        drop_reason: DropReason,
+    }
+
+    #[async_trait]
+    impl Consumer for SimpleConsumer {
+        async fn consume_cdc(&mut self, row: CDCRow<'_>) -> Result<()> {
+            info!("Consuming cdc row {}", row.operation);
+            let mut state = self.state.lock().await;
+
+            if let State::WaitingForFirst = *state {
+                let mut lock = self.proxy.lock().await;
+
+                info!("Transitioning to dropped state");
+                lock.running_nodes.iter_mut().for_each(|node| {
+                    node.change_response_rules(Some(vec![ResponseRule(
+                        scylla_proxy::Condition::True,
+                        match self.drop_reason {
+                            DropReason::DropPackets => Reaction::drop_frame(),
+                            DropReason::_DropConnection => {
+                                Reaction::drop_connection_with_delay(Duration::from_secs(1))
+                            }
+                        },
+                    )]))
+                });
+
+                *state = State::Disabled;
+                drop(state);
+                drop(lock);
+
+                self.reconnection.send(()).await.unwrap();
+                /* let lock_clone = self.proxy.clone();
+                let state_clone = self.state.clone();
+                let reconnection = self.reconnection.clone();
+                tokio::task::spawn(async move {
+                }); */
+            } else if let State::WaitingForReconnection = *state {
+                info!("Got update after reconnection.");
+                self.finisher.send(()).await.unwrap();
+            }
+
+            Ok(())
+        }
+    }
+
+    struct SimpleConsumerFactory {
+        proxy: Arc<Mutex<RunningProxy>>,
+        state: Arc<Mutex<State>>,
+        finisher: Sender<()>,
+        reconnection: Sender<()>,
+        drop_reason: DropReason,
+    }
+
+    #[async_trait]
+    impl ConsumerFactory for SimpleConsumerFactory {
+        async fn new_consumer(&self) -> Box<dyn Consumer> {
+            Box::new(SimpleConsumer {
+                proxy: __self.proxy.clone(),
+                state: __self.state.clone(),
+                finisher: __self.finisher.clone(),
+                reconnection: __self.reconnection.clone(),
+                drop_reason: __self.drop_reason,
+            })
+        }
+    }
+
+    #[rstest]
+    #[case::drop_packets(DropReason::DropPackets, "127.0.0.70:9042", "test_keyspace_1")]
+    // TODO: Would require merging #144
+    // #[case::drop_packets(DropReason::DropConnection, "127.0.0.71:9042", "test_keyspace_2")]
+    #[tokio::test]
+    #[traced_test]
+    #[ntest::timeout(80_000)]
+    async fn should_recover_from_dropped_packets(
+        #[case] drop_reason: DropReason,
+        #[case] proxy_address: &str,
+        #[case] keyspace: &str,
+    ) {
+        // In case of test flakiness, increase the safety_interval and window_size
+        // in the CDCLogReaderBuilder. The current times were enough for local testing,
+        // but there may be conditions, where those times may be insufficient.
+        use std::{net::SocketAddr, str::FromStr};
+
+        use scylla::client::{
+            execution_profile::ExecutionProfileBuilder, session_builder::SessionBuilder,
+        };
+        use scylla_proxy::{Node, Proxy, ShardAwareness};
+        use tokio::sync::mpsc::channel;
+
+        let db_address =
+            std::env::var("SCYLLA_URI").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
+        info!("Attempting to connect to ScyllaDB at {}", db_address);
+
+        let node1_real_addr = SocketAddr::from_str(&db_address).unwrap();
+        let node1_proxy_addr = SocketAddr::from_str(proxy_address).unwrap();
+        let proxy = Proxy::new([Node::new(
+            node1_real_addr,
+            node1_proxy_addr,
+            ShardAwareness::QueryNode,
+            None,
+            None,
+        )]);
+        let running_proxy = proxy.run().await.unwrap();
+
+        let builder = SessionBuilder::new().known_node(proxy_address);
+
+        let session: Arc<Session> = Arc::new(
+            builder
+                .default_execution_profile_handle(
+                    ExecutionProfileBuilder::default()
+                        .request_timeout(Some(Duration::from_millis(500)))
+                        .build()
+                        .into_handle(),
+                )
+                .keepalive_timeout(Duration::from_millis(1500))
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let direct_session: Arc<Session> = Arc::new(
+            SessionBuilder::new()
+                .known_node(&db_address)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        init_db(&direct_session, keyspace).await;
+
+        info!("Session created successfully.");
+
+        let state = Arc::new(Mutex::new(State::WaitingForFirst));
+        let proxy = Arc::new(Mutex::new(running_proxy));
+        let (finisher_tx, mut finisher_rx) = channel(1);
+        let (reconnection_tx, mut reconnection_rx) = channel(1);
+
+        let (mut reader, handle) = CDCLogReaderBuilder::new()
+            .session(session.clone())
+            .keyspace(keyspace)
+            .table_name("cdc_test_table")
+            .safety_interval(Duration::from_secs(5))
+            .window_size(Duration::from_secs(10))
+            .consumer_factory(Arc::new(SimpleConsumerFactory {
+                proxy: proxy.clone(),
+                state: state.clone(),
+                finisher: finisher_tx,
+                reconnection: reconnection_tx,
+                drop_reason,
+            }))
+            .build()
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        info!("Sending row to trigger CDC...");
+        generate_cdc_update(&direct_session, keyspace).await;
+
+        reconnection_rx.recv().await;
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let mut state = state.lock().await;
+        let mut proxy = proxy.lock().await;
+        info!("Re-enabling connections");
+
+        *state = State::WaitingForReconnection;
+        proxy
+            .running_nodes
+            .iter_mut()
+            .for_each(|node| node.change_response_rules(Some(vec![])));
+
+        drop(state);
+        drop(proxy);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        info!("Connection re-established, sending another update...");
+
+        generate_cdc_update(&direct_session, keyspace).await;
+
+        finisher_rx.recv().await;
+        info!("Shutdown signal received.");
+        reader.stop();
+        handle.await.unwrap();
+
+        info!("CDC stream stopped.");
     }
 }
