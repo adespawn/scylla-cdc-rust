@@ -46,3 +46,6 @@ tokio = { version = "1.1.0", features = [
     "rt-multi-thread",
 ] }
 rstest = "0.26.1"
+scylla-proxy = "0.0.5"
+tracing-test = "0.2.5"
+ntest = "0.9.5"
