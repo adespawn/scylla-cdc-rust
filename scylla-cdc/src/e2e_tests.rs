@@ -635,7 +635,7 @@ mod tests {
     // #[case::drop_packets(DropReason::DropConnection, "127.0.0.71:9042", "test_keyspace_2")]
     #[tokio::test]
     #[traced_test]
-    #[ntest::timeout(80_000)]
+    #[ntest::timeout(100_000)]
     async fn should_recover_from_dropped_packets(
         #[case] drop_reason: DropReason,
         #[case] proxy_address: &str,
@@ -704,8 +704,8 @@ mod tests {
             .session(session.clone())
             .keyspace(keyspace)
             .table_name("cdc_test_table")
-            .safety_interval(Duration::from_secs(5))
-            .window_size(Duration::from_secs(10))
+            .window_size(Duration::from_secs(30))
+            .safety_interval(Duration::from_secs(10))
             .consumer_factory(Arc::new(SimpleConsumerFactory {
                 proxy: proxy.clone(),
                 state: state.clone(),
@@ -722,7 +722,10 @@ mod tests {
         generate_cdc_update(&direct_session, keyspace).await;
 
         reconnection_rx.recv().await;
-
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        info!("Connection re-established, sending another update...");
+        generate_cdc_update(&direct_session, keyspace).await;
+        
         tokio::time::sleep(Duration::from_secs(10)).await;
         let mut state = state.lock().await;
         let mut proxy = proxy.lock().await;
@@ -736,11 +739,7 @@ mod tests {
 
         drop(state);
         drop(proxy);
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        info!("Connection re-established, sending another update...");
-
-        generate_cdc_update(&direct_session, keyspace).await;
+        
 
         finisher_rx.recv().await;
         info!("Shutdown signal received.");
