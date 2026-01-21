@@ -704,8 +704,8 @@ mod tests {
             .session(session.clone())
             .keyspace(keyspace)
             .table_name("cdc_test_table")
-            .window_size(Duration::from_secs(30))
-            .safety_interval(Duration::from_secs(10))
+            .window_size(Duration::from_secs(20))
+            .safety_interval(Duration::from_secs(5))
             .consumer_factory(Arc::new(SimpleConsumerFactory {
                 proxy: proxy.clone(),
                 state: state.clone(),
